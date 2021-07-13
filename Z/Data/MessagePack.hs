@@ -67,7 +67,9 @@ module Z.Data.MessagePack
     MessagePack(..), Value(..), defaultSettings, Settings(..), JSON.snakeCase, JSON.trainCase
     -- * Encode & Decode
   , readMessagePackFile, writeMessagePackFile
-  , decode, decode', decodeChunk, decodeChunks, encode, encodeChunks
+  , decode, decode'
+  , ParseChunks,  decodeChunk, decodeChunks
+  , encode, encodeChunks
   , DecodeError, ParseError
     -- * parse into MessagePack Value
   , parseValue, parseValue'

@@ -6,7 +6,11 @@
 [![Windows Build Status](https://github.com/haskell-Z/z-messagepack/workflows/win-ci/badge.svg)](https://github.com/haskell-Z/z-messagepack/actions)
 [![Gitter chat](https://badges.gitter.im/gitterHQ/gitter.svg)](https://gitter.im/Z-Haskell/community)
 
-This package is part of [Z](https://github.com/haskell-Z/Z) project, provides MessagePack codecs.
+This package is part of [Z](https://github.com/haskell-Z/Z) project, provides MessagePack codecs. 
+
+> MessagePack is an efficient binary serialization format. It lets you exchange data among multiple languages like JSON. But it's faster and smaller. Small integers are encoded into a single byte, and typical short strings require only one extra byte in addition to the strings themselves.
+
+In short, MessagePack is JSON in binary.
 
 ## Requirements
 

@@ -15,8 +15,10 @@ module Z.Data.MessagePack.Base
   ( -- * MessagePack Class
     MessagePack(..), Value(..), defaultSettings, Settings(..)
     -- * Encode & Decode
-  , decode, decode', decodeChunk, decodeChunks, encode, encodeChunks
-  , DecodeError, P.ParseError, P.ParseChunks
+  , decode, decode'
+  , P.ParseChunks,  decodeChunk, decodeChunks
+  , encode, encodeChunks
+  , DecodeError, P.ParseError
     -- * parse into MessagePack Value
   , MV.parseValue, MV.parseValue'
   -- * Generic FromValue, ToValue & EncodeMessagePack
@@ -165,9 +167,12 @@ decodeChunks :: (MessagePack a, Monad m) => P.ParseChunks m DecodeError a
 decodeChunks = P.parseChunks decodeChunk
 
 -- | Directly encode data to MessagePack bytes.
+--
+-- This function use 'B.buildWith' 'V.smallChunkSize' to balance common use case, if you need fine tuning on memory usage,
+-- please use 'B.buildWith' and a custom initial chunk size with 'encodeMessagePack'.
 encode :: MessagePack a => a -> V.Bytes
 {-# INLINE encode #-}
-encode = B.build . encodeMessagePack
+encode = B.buildWith V.smallChunkSize . encodeMessagePack
 
 -- | Encode data to MessagePack bytes chunks.
 encodeChunks :: MessagePack a => a -> [V.Bytes]
@@ -186,7 +191,7 @@ typeMismatch :: T.Text     -- ^ The name of the type you are trying to convert.
              -> T.Text     -- ^ The MessagePack value type you expecting to meet.
              -> Value      -- ^ The actual value encountered.
              -> Converter a
-{-# INLINE typeMismatch #-}
+{-# INLINABLE typeMismatch #-}
 typeMismatch name expected v =
     fail' $ T.concat ["converting ", name, " failed, expected ", expected, ", encountered ", actual]
   where
@@ -869,7 +874,7 @@ instance MessagePack a => MessagePack (FIM.FlatIntMap a) where
     encodeMessagePack m = do
         let kvs = FIM.sortedKeyValues m
         MB.mapHeader (V.length kvs)
-        V.traverseVec_ (\ (V.IPair k v) -> MB.int (fromIntegral k) >> encodeMessagePack v) kvs
+        V.traverse_ (\ (V.IPair k v) -> MB.int (fromIntegral k) >> encodeMessagePack v) kvs
 
 instance MessagePack a => MessagePack (IM.IntMap a) where
     {-# INLINE fromValue #-}

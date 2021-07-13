@@ -14,6 +14,7 @@ module Z.Data.MessagePack.Builder where
 import           Control.Monad
 import           Data.Bits
 import           GHC.Int
+import qualified Data.Scientific            as Sci
 import           Data.Word
 import           Data.Primitive.PrimArray
 import           GHC.Exts
@@ -24,6 +25,7 @@ import qualified Z.Data.Text                as T
 import qualified Z.Data.Builder             as B
 import qualified Z.Data.Vector              as V
 import           Z.Data.MessagePack.Value   hiding (value)
+import qualified Z.Data.JSON                as J
 
 value :: Value -> B.Builder ()
 {-# INLINABLE value #-}
@@ -85,7 +87,6 @@ scientificValue c e = Ext (if c > 0 then 0x00 else 0x01) . B.build $ do
 --  +--------+--------+--------+--------+
 --  |  0xD5  |  0x00  |  0x00  |  0x00  |
 --  +--------+--------+--------+--------+
---
 --
 --  +--------+--------+--------+-----------------------------------------+---------------------------------------+
 --  |  0xC7  |XXXXXXXX|  0x00  | base10 exponent(MessagePack int format) | coefficient(big endian 256-base limbs |
@@ -161,7 +162,7 @@ array :: V.Vec v a => (a -> B.Builder ()) -> v a -> B.Builder ()
 {-# INLINE array #-}
 array p xs = do
     arrayHeader (V.length xs)
-    V.traverseVec_ p xs
+    V.traverse_ p xs
 
 array' :: (a -> B.Builder ()) -> [a] -> B.Builder ()
 {-# INLINE array' #-}
@@ -180,7 +181,7 @@ map :: (a -> B.Builder ()) -> (b -> B.Builder ()) -> V.Vector (a, b) -> B.Builde
 {-# INLINE map #-}
 map p q xs = do
     mapHeader (V.length xs)
-    V.traverseVec_ (\(a, b) -> p a >> q b) xs
+    V.traverse_ (\(a, b) -> p a >> q b) xs
 
 map' :: (a -> B.Builder ()) -> (b -> B.Builder ()) -> [(a, b)] -> B.Builder ()
 {-# INLINE map' #-}
@@ -209,3 +210,33 @@ ext typ dat = do
             | otherwise     -> B.encodePrim (0xC9 :: Word8, BE (fromIntegral len :: Word32))
     B.word8 typ
     B.bytes dat
+
+fromJSONValue :: HasCallStack => J.Value -> Value
+fromJSONValue (J.Bool b) = Bool b
+fromJSONValue (J.Number x) =
+    case Sci.toBoundedInteger x :: Maybe Int64 of
+        Just x' -> Int x'
+        _ -> scientificValue (coefficient x) (fromIntegral (base10Exponent x))
+fromJSONValue (J.String s) = Str s
+fromJSONValue (J.Object m) |
+    | V.length m == 1 =
+        let (k, v) = V.unsafeIndex m 0
+        if T.isPrefixOf "__messagepack_complex_key_" k
+        then Map $! ()
+        else if k == "__base64"
+            then
+            else if k == "__ext"
+                then
+                else
+
+    | otherwise = Map $! go <$> m
+  where
+    go (k, v) =
+        case J.decodeText' k of
+            Right k' ->
+                let !k'' = fromJSONValue k'
+                    !v' = fromJSONValue v
+                in (k'', v')
+            _  -> error ""
+fromJSONValue (J.Array v) = Array $! fromJSONValue <$> v
+fromJSONValue J.Null = Nil

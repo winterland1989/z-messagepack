@@ -8,6 +8,10 @@ Stability   : experimental
 Portability : non-portable
 
 This module provides <https://github.com/msgpack-rpc/msgpack-rpc/blob/master/spec.md MessagePack-RPC> implementation.
+
+MessagePack-RPC is a lightweight Remote Procedure Call (RPC) Protocol using MessagePack data format.
+In Z-MessagePack we also extend the protocol to support simple streaming calls(server to client), see 'callStream'.
+
 -}
 
 module Z.IO.RPC.MessagePack
@@ -63,12 +67,13 @@ import qualified Z.Data.MessagePack         as MP
 import qualified Z.Data.MessagePack.Builder as MB
 import qualified Z.Data.MessagePack.Value   as MV
 import qualified Z.Data.Parser              as P
-import           Z.Data.PrimRef.PrimIORef
+import           Z.Data.PrimRef
 import qualified Z.Data.Text                as T
 import qualified Z.Data.Vector              as V
 import qualified Z.Data.Vector.FlatIntMap   as FIM
 import qualified Z.Data.Vector.FlatMap      as FM
 import           Z.IO
+import           Z.IO.BIO                   (Source, sourceFromIO, pattern EOF)
 import           Z.IO.Network
 
 -------------------------------------------------------------------------------
@@ -128,11 +133,11 @@ type PipelineResult = FIM.FlatIntMap MV.Value
 --
 callPipeline :: HasCallStack => MessagePack req => Client -> T.Text -> req -> IO PipelineId
 callPipeline (Client seqRef reqNum _ bo) name req = do
-    x <- readPrimIORef reqNum
+    x <- readCounter reqNum
     when (x == (-1)) $ throwIO (RPCStreamUnconsumed callStack)
-    writePrimIORef reqNum (x+1)
-    msgid <- readPrimIORef seqRef
-    writePrimIORef seqRef (msgid+1)
+    writeCounter reqNum (x+1)
+    msgid <- readCounter seqRef
+    writeCounter seqRef (msgid+1)
     let !msgid' = msgid .&. 0xFFFFFFFF  -- shrink to unsiged 32bits
     writeBuilder bo $ do
         MB.arrayHeader 4
@@ -147,7 +152,7 @@ callPipeline (Client seqRef reqNum _ bo) name req = do
 -- Notify calls doesn't affect execution's result.
 notifyPipeline :: HasCallStack => MessagePack req => Client -> T.Text -> req -> IO ()
 notifyPipeline (Client _ reqNum _ bo) name req = do
-    x <- readPrimIORef reqNum
+    x <- readCounter reqNum
     when (x == (-1)) $ throwIO (RPCStreamUnconsumed callStack)
     writeBuilder bo $ do
         MB.arrayHeader 3
@@ -166,9 +171,9 @@ instance Exception RPCException
 execPipeline :: HasCallStack => Client -> IO PipelineResult
 execPipeline (Client _ reqNum bi bo) = do
     flushBuffer bo
-    x <- readPrimIORef reqNum
+    x <- readCounter reqNum
     when (x == (-1)) $ throwIO (RPCStreamUnconsumed callStack)
-    writePrimIORef reqNum 0
+    writeCounter reqNum 0
     FIM.packN x <$> replicateM x (do
         (msgid, err, v) <- readParser (do
             tag <- P.anyWord8
@@ -218,9 +223,9 @@ fetchPipeline msgid r = do
 -- otherwise the state of the `Client` will be incorrect.
 callStream :: (MessagePack req, MessagePack res, HasCallStack) => Client -> T.Text -> req -> IO (IO (), Source res)
 callStream (Client _seqRef reqNum bi bo) name req = do
-    x <- readPrimIORef reqNum
+    x <- readCounter reqNum
     when (x == (-1)) $ throwIO (RPCStreamUnconsumed callStack)
-    writePrimIORef reqNum (-1)
+    writeCounter reqNum (-1)
     writeBuilder bo $ do
         MB.arrayHeader 3
         MB.int 4                        -- type request
@@ -236,7 +241,7 @@ callStream (Client _seqRef reqNum bi bo) name req = do
                     !typ <- MV.value
                     when (typ /= MV.Int 7) $
                         P.fail' $ "wrong response type: " <> T.toText typ
-                    return Nothing
+                    return EOF
                 0x93 -> do
                     !typ <- MV.value
                     !err <- MV.value
@@ -253,8 +258,8 @@ callStream (Client _seqRef reqNum bi bo) name req = do
                 when (err /= MV.Nil) $ throwIO (RPCException err callStack)
                 unwrap "EPARSE" (MP.convertValue v)
             _ -> do
-                writePrimIORef reqNum 0
-                return Nothing
+                writeCounter reqNum 0
+                return EOF
         )
   where
     sendEOF = do
@@ -325,6 +330,7 @@ data Request a
     = Notify (T.Text, a)
     | Call (Int64, T.Text, a)
     | StreamStart (T.Text, a)
+    | StreamStop
   deriving Show
 
 -- | Serve a RPC service with more control.
@@ -339,7 +345,7 @@ serveRPC' serve recvBufSiz sendBufSiz handle = serve $ \ uvs -> do
     loop ctx bi bo
   where
     loop ctx bi bo = do
-        req <- readParser sourceParser bi
+        req <- readParser requestParser bi
         case req of
             Notify (name, v) -> do
                 case handle name of
@@ -375,25 +381,24 @@ serveRPC' serve recvBufSiz sendBufSiz handle = serve $ \ uvs -> do
             StreamStart (name, v) -> do
                 eofRef <- newIORef False
                 -- fork new thread to get stream end notification
-                forkIO $ do
-                    _ <- readParser (do
-                        tag <- P.anyWord8
-                        -- stream stop
-                        when (tag /= 0x91) $
-                            P.fail' $ "wrong request tag: " <> T.toText tag
-                        !typ <- MV.value
-                        when (typ /= MV.Int 5) $
-                            P.fail' $ "wrong request type: " <> T.toText typ
-                        ) bi
-                    atomicWriteIORef eofRef True
-
+                stream_end_thread <- forkIO . forever $ do
+                    req <- readParser requestParser bi
+                    case req of
+                        StreamStop -> atomicWriteIORef eofRef True
+                        -- ignore other type request during streaming
+                        _ -> return ()
                 case handle name of
-                    Just (StreamHandler f) -> (do
+                    Just (StreamHandler f) -> do
                         src <- f ctx eofRef =<< unwrap "EPARSE" (MP.convertValue v)
-                        src (writeItem bo) EOF) `catch` (\ (e :: SomeException) ->
+                        src (writeItem bo) EOF `catch` (\ (e :: SomeException) ->
                             writeErrorItem bo $ "error when stream: " <> T.toText e)
+                        -- stop receive stream stop after server stream ends, incoming stop request will be ignored by server loop
+                        killThread stream_end_thread
                     _ -> writeErrorItem bo $ "request method: " <> name <> " not found"
                 loop ctx bi bo
+
+            -- other requests(stream stop, etc) are ignored
+            _ -> loop ctx bi bo
 
     writeItem bo = \ mx -> do
         case mx of
@@ -420,9 +425,9 @@ serveRPC' serve recvBufSiz sendBufSiz handle = serve $ \ uvs -> do
 
 -------------------------------------------------------------------------------
 
-sourceParser :: P.Parser (Request MV.Value)
-{-# INLINE sourceParser #-}
-sourceParser = do
+requestParser :: P.Parser (Request MV.Value)
+{-# INLINE requestParser #-}
+requestParser = do
     tag <- P.anyWord8
     case tag of
         -- notify or stream start
@@ -451,6 +456,13 @@ sourceParser = do
                         _ -> P.fail' $ "wrong RPC name: " <> T.toText name
                     _ -> P.fail' $ "wrong msgid: " <> T.toText seq_
                 _ -> P.fail' $ "wrong request type: " <> T.toText typ
+
+        0x91 -> do
+            !typ <- MV.value
+            case typ of
+                MV.Int 5 -> pure StreamStop
+                _ -> P.fail' $ "wrong request type: " <> T.toText typ
+
         _ -> P.fail' $ "wrong request tag: " <> T.toText tag
 
 -- $server-example
@@ -460,7 +472,8 @@ sourceParser = do
 -- > import Z.IO.Network
 -- > import Data.IORef
 -- > import Z.IO
--- > import qualified Z.Data.Text as T
+-- > import qualified Z.IO.BIO      as BIO
+-- > import qualified Z.Data.Text   as T
 -- > import qualified Z.Data.Vector as V
 -- >
 -- > newtype ServerCtx = ServerCtx { counter :: Int }
@@ -478,15 +491,15 @@ sourceParser = do
 -- >      counter . fromJust <$> readSessionCtx ctx
 -- >    )
 -- >  , ("qux", StreamHandler $ \ctx eofRef (_ :: ()) -> do
--- >      withMVar stdinBuf (\ stdin -> pure $ \ k _ -> do
+-- >      withMVar stdinBuf (\ stdin -> pure . BIO.sourceFromIO $ do
 -- >        eof <- readIORef eofRef
 -- >        if eof
--- >        then k EOF
+-- >        then pure Nothing
 -- >        else do
 -- >            r <- readBuffer stdin
 -- >            if V.null r
--- >            then k EOF
--- >            else k (Just r))
+-- >            then pure Nothing
+-- >            else pure (Just r))
 -- >    )
 -- >  ]
 
@@ -497,6 +510,7 @@ sourceParser = do
 -- > import Z.IO.Network
 -- > import Data.IORef
 -- > import Z.IO
+-- > import qualified Z.IO.BIO    as BIO
 -- > import qualified Z.Data.Text as T
 -- > import qualified Z.Data.Vector as V
 -- >
@@ -513,6 +527,4 @@ sourceParser = do
 -- >
 -- >   -- streaming result
 -- >   (_, src) <- callStream c "qux" ()
--- >   runBIO_ $ src . sinkToIO (\ b -> withMVar stdoutBuf (\ bo -> do
--- >     writeBuffer bo b
--- >     flushBuffer bo))
+-- >   BIO.run_ $ src . BIO.sinkToIO (\ b -> printStdLn b)

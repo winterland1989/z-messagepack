@@ -13,20 +13,29 @@ module Z.Data.MessagePack.Value(
   , parseValue'
     -- * Value Parsers
   , value
+    -- * Convert JSON & MessagePack Values
+  , toJSONValue
   ) where
 
 import           Control.DeepSeq
 import           Control.Monad
 import           Data.Bits
 import           Data.Int
+import qualified Data.Scientific            as Sci
 import           Data.Word
+import           GHC.Exts
+import           GHC.Integer.GMP.Internals
+import           GHC.Stack
 import           GHC.Generics               (Generic)
 import           Test.QuickCheck.Arbitrary  (Arbitrary, arbitrary)
 import qualified Test.QuickCheck.Gen        as Gen
 import           Prelude                    hiding (map)
+import qualified Z.Data.Array               as A
 import qualified Z.Data.Text                as T
 import qualified Z.Data.Parser              as P
-import qualified Z.Data.Vector              as V
+import qualified Z.Data.Vector.Base         as V
+import qualified Z.Data.JSON                as J
+import           Z.Data.JSON.Value          (floatToScientific, doubleToScientific)
 
 -- | Representation of MessagePack data.
 data Value
@@ -151,3 +160,46 @@ parseValue = P.parse value
 parseValue' :: V.Bytes -> Either P.ParseError Value
 {-# INLINE parseValue' #-}
 parseValue' = P.parse' (value <* P.endOfInput)
+
+-- | Convert MessagePack's 'Value' to JSON 'J.Value'.
+--
+-- There're some conventions on 'toJSONValue' function:
+--
+--  * MessagePack's 'Map' support arbitrary key types, while JSON 'J.Object' only support text keys,
+--    so if a non-text key is met, it will be converted to JSON String first, then prepended with @__messagepack_complex_key_@,
+--    otherwise it will be used as it is.
+--
+--  * MessagePack's 'Bin' type will be converted into a JSON object with a @__base64@ field.
+--
+--  * MessagePack's 'Ext' type will be converted into JSON Number if the tag is 0x00 or 0x01(see documents in "Z.Data.MessagePack"
+--    for more details on how @Z-MessagePack@ encode scientific numbers with ext format), otherwise will be converted to JSON
+--    object @{"__ext":{"__tag": ..., "__payload": ...}}@.
+--
+--  * Other types will have obvious behaviors: 'Bool' maps to 'J.Bool'; 'Int', 'Float' and 'Double' map to 'J.Number',
+--    'Str' maps to 'J.String', 'Array' maps to 'J.Array' and 'Nil' maps to 'J.Null'.
+--
+toJSONValue :: HasCallStack => Value -> J.Value
+{-# INLINABLE toJSONValue #-}
+toJSONValue (Bool b  ) = J.Bool b
+toJSONValue (Int  i  ) = J.Number $! fromIntegral i
+toJSONValue (Float f ) = J.Number $! floatToScientific f
+toJSONValue (Double d) = J.Number $! doubleToScientific d
+toJSONValue (Str t   ) = J.String t
+toJSONValue (Bin b   ) = J.object $ [ "__base64" J..=  b ]
+toJSONValue (Array v ) = J.Array $! toJSONValue <$> v
+toJSONValue (Map m   ) = J.Object $! (\ (k, v) -> let !k' = case v of
+                                                        Str v' -> J.String v'
+                                                        _ -> "__messagepack_complex_key_" <> J.encodeText (toJSONValue v)
+                                                      !v' = toJSONValue v
+                                                  in (k', v')) <$> m
+toJSONValue (Ext tag payload)
+    | tag <= 0x01 =
+        case P.parse value payload of
+            ((V.PrimVector (A.PrimArray ba#) (I# s#) (I# l#)) , Right (Int d)) ->
+                let !c = importIntegerFromByteArray ba# (int2Word# s#) (int2Word# l#) 1#
+                    !e = fromIntegral d
+                in if tag == 0x01 then J.Number $! negate (Sci.scientific c e)
+                                  else J.Number $! Sci.scientific c e
+            _ -> error "converting MessagePack value to JSON value failed: illegal Ext 00/01 payload."
+    | otherwise = J.object [ "__ext" J..= J.object [ "__tag" J..= tag, "__payload" J..= payload ]]
+toJSONValue Nil        = J.Null
